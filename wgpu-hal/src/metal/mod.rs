@@ -793,6 +793,14 @@ impl crate::Queue for Queue {
                     let block = block2::RcBlock::new(
                         |cmd_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                             let cmd_buf = unsafe { cmd_buf.as_ref() };
+                            if gpu_stats::by_label() {
+                                let label = cmd_buf.label().map(|l| l.to_string());
+                                gpu_stats::record_label(
+                                    label,
+                                    cmd_buf.GPUStartTime(),
+                                    cmd_buf.GPUEndTime(),
+                                );
+                            }
                             gpu_stats::record(cmd_buf.GPUStartTime(), cmd_buf.GPUEndTime());
                         },
                     );
@@ -1455,6 +1463,61 @@ mod gpu_stats {
     pub fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_PERF").is_some())
+    }
+
+    /// With `RUFFLE_GPU_LABELS` too: GPU time is also summed per command buffer label
+    /// (with digits removed), and the most expensive labels are printed once a second.
+    /// Command buffers overlap on the GPU, so each one is only attributed the time
+    /// between the end of the previous one (or its start, if later) and its end.
+    /// Labels need Ruffle's `render_debug_labels` feature, and are only meaningful
+    /// with one pass per command buffer (`flag share-cmdbufs 0`).
+    pub fn by_label() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_GPU_LABELS").is_some())
+    }
+
+    struct LabelStats {
+        window_start: f64,
+        last_end: f64,
+        times: std::collections::HashMap<std::string::String, (f64, u32)>,
+    }
+
+    static LABELS: Mutex<Option<LabelStats>> = Mutex::new(None);
+
+    pub fn record_label(label: Option<std::string::String>, start: f64, end: f64) {
+        if end <= 0.0 || end < start {
+            return;
+        }
+        let label: std::string::String = label
+            .unwrap_or_else(|| "<none>".into())
+            .chars()
+            .filter(|c| !c.is_ascii_digit())
+            .collect();
+        let mut guard = LABELS.lock();
+        let stats = guard.get_or_insert_with(|| LabelStats {
+            window_start: start,
+            last_end: 0.0,
+            times: Default::default(),
+        });
+        let exclusive = (end - start.max(stats.last_end)).max(0.0);
+        stats.last_end = stats.last_end.max(end);
+        let entry = stats.times.entry(label).or_default();
+        entry.0 += exclusive;
+        entry.1 += 1;
+        let window = end - stats.window_start;
+        if window >= 1.0 {
+            let mut times: std::vec::Vec<_> = stats.times.drain().collect();
+            times.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+            let top: std::vec::Vec<std::string::String> = times
+                .iter()
+                .take(14)
+                .map(|(label, (time, count))| {
+                    std::format!("{label}={:.1}ms/s({count})", time * 1000.0 / window)
+                })
+                .collect();
+            std::eprintln!("[gpu-label] {}", top.join(" | "));
+            stats.window_start = end;
+        }
     }
 
     pub fn record(start: f64, end: f64) {
