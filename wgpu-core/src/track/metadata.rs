@@ -34,8 +34,16 @@ impl<T: Clone> ResourceMetadata<T> {
         resize_bitvec(&mut self.owned, size);
     }
 
-    pub(super) fn clear(&mut self) {
-        self.resources.clear();
+    /// Removes all members, keeping the tables at their current size.
+    ///
+    /// Ruffle patch: `clear` followed by `set_size` (as usage scopes do for every
+    /// render pass) costs time proportional to the number of resources that exist,
+    /// which is very slow with thousands of resources and hundreds of passes per
+    /// frame. This only touches the members (plus a scan of the occupancy bits).
+    pub(super) fn clear_sparse(&mut self) {
+        for index in iterate_bitvec_indices(&self.owned) {
+            self.resources[index] = None;
+        }
         self.owned.fill(false);
     }
 

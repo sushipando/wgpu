@@ -92,8 +92,11 @@ impl BufferUsageScope {
         self.metadata.tracker_assert_in_bounds(index);
     }
     pub fn clear(&mut self) {
-        self.state.clear();
-        self.metadata.clear();
+        // Ruffle patch: only reset what was used (see `ResourceMetadata::clear_sparse`).
+        for index in self.metadata.owned_indices() {
+            self.state[index] = BufferUses::empty();
+        }
+        self.metadata.clear_sparse();
     }
 
     /// Sets the size of all the vectors inside the tracker.

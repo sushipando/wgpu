@@ -183,11 +183,6 @@ impl TextureStateSet {
         }
     }
 
-    fn clear(&mut self) {
-        self.simple.clear();
-        self.complex.clear();
-    }
-
     fn set_size(&mut self, size: usize) {
         self.simple.resize(size, TextureUses::UNINITIALIZED);
     }
@@ -285,8 +280,12 @@ impl TextureUsageScope {
     }
 
     pub fn clear(&mut self) {
-        self.set.clear();
-        self.metadata.clear();
+        // Ruffle patch: only reset what was used (see `ResourceMetadata::clear_sparse`).
+        for index in self.metadata.owned_indices() {
+            self.set.simple[index] = TextureUses::UNINITIALIZED;
+        }
+        self.set.complex.clear();
+        self.metadata.clear_sparse();
     }
 
     /// Sets the size of all the vectors inside the tracker.
