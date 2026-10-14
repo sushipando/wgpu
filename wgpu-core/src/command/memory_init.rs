@@ -40,6 +40,12 @@ pub(crate) struct CommandBufferTextureMemoryActions {
 }
 
 impl CommandBufferTextureMemoryActions {
+    /// Ruffle patch: whether any surface is in the discarded state (so that using it
+    /// again needs a clear first).
+    pub(crate) fn has_discards(&self) -> bool {
+        !self.discards.is_empty()
+    }
+
     pub(crate) fn drain_init_actions(&mut self) -> Drain<'_, TextureInitTrackerAction> {
         self.init_actions.drain(..)
     }

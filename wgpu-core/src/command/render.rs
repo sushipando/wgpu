@@ -2302,17 +2302,31 @@ pub(super) fn encode_render_pass(
 
     let mut indirect_draw_validation_batcher = crate::indirect_validation::DrawBatcher::new();
 
-    // We automatically keep extending command buffers over time, and because
-    // we want to insert a command buffer _before_ what we're about to record,
-    // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    // Ruffle patch: see `can_share_command_buffer`.
+    let share_command_buffer = can_share_command_buffer(
+        device,
+        &base.commands,
+        &color_attachments,
+        depth_stencil_attachment.as_ref(),
+        timestamp_writes.is_some() || occlusion_query_set.is_some(),
+        parent_state.texture_memory_actions.has_discards(),
+    );
+
+    let raw_encoder = if share_command_buffer {
+        parent_state.raw_encoder.open().map_pass_err(pass_scope)?
+    } else {
+        // We automatically keep extending command buffers over time, and because
+        // we want to insert a command buffer _before_ what we're about to record,
+        // we need to make sure to close the previous one.
+        parent_state
+            .raw_encoder
+            .close_if_open()
+            .map_pass_err(pass_scope)?;
+        parent_state
+            .raw_encoder
+            .open_pass(base.label.as_deref())
+            .map_pass_err(pass_scope)?
+    };
 
     let (scope, pending_discard_init_fixups, mut pending_query_resets) = {
         let mut pending_query_resets = QueryResetMap::new();
@@ -2713,12 +2727,25 @@ pub(super) fn encode_render_pass(
 
         let pending_discard_init_fixups = state.pass.pending_discard_init_fixups;
 
-        parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
+        if !share_command_buffer {
+            parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
+        }
         (trackers, pending_discard_init_fixups, pending_query_resets)
     };
 
     let encoder = &mut parent_state.raw_encoder;
     let tracker = &mut parent_state.tracker;
+
+    if share_command_buffer {
+        // Ruffle patch: the only commands needed before this pass are barriers, which do
+        // nothing on this backend. Record them (which updates the tracker) after the
+        // pass instead, and keep recording into the same command buffer.
+        debug_assert!(pending_discard_init_fixups.is_empty());
+        debug_assert!(indirect_draw_validation_batcher.is_empty());
+        let raw = encoder.open().map_pass_err(pass_scope)?;
+        CommandEncoder::insert_barriers_from_scope(raw, tracker, &scope, parent_state.snatch_guard);
+        return Ok(());
+    }
 
     {
         let transit = encoder
@@ -2765,6 +2792,60 @@ pub(super) fn encode_render_pass(
     encoder.close_and_swap().map_pass_err(pass_scope)?;
 
     Ok(())
+}
+
+/// Ruffle patch: whether a render pass can be recorded into the same raw command buffer as
+/// the commands before it, instead of a new one.
+///
+/// Normally, each pass gets its own raw command buffer, because the barriers and
+/// fixups that must run before it are only known after recording it. They're recorded
+/// into another command buffer that's then submitted before the pass's. But on Metal,
+/// that costs a command buffer per pass (hundreds per frame in Ruffle), and barriers do
+/// nothing there. So when the pass can't need anything else before it, it can go into
+/// the current command buffer, with its (no-op) barriers recorded after it.
+///
+/// Conservatively, the pass must not need:
+/// - clears of discarded surfaces (none are discarded so far, and it discards none),
+/// - query resets (no queries),
+/// - indirect draw validation (no indirect draws or bundles, which may contain them).
+fn can_share_command_buffer(
+    device: &Device,
+    commands: &[ArcRenderCommand],
+    color_attachments: &ColorAttachments<Arc<TextureView>>,
+    depth_stencil_attachment: Option<&ResolvedRenderPassDepthStencilAttachment<Arc<TextureView>>>,
+    has_pass_queries: bool,
+    has_discards: bool,
+) -> bool {
+    if device.backend() != wgt::Backend::Metal
+        || !crate::ruffle_patch::share_command_buffers()
+        || has_pass_queries
+        || has_discards
+    {
+        return false;
+    }
+    let discards_color = color_attachments
+        .iter()
+        .flatten()
+        .any(|at| at.store_op == StoreOp::Discard);
+    let discards_depth_stencil = depth_stencil_attachment.is_some_and(|at| {
+        at.depth.store_op() == StoreOp::Discard || at.stencil.store_op() == StoreOp::Discard
+    });
+    if discards_color || discards_depth_stencil {
+        return false;
+    }
+    !commands.iter().any(|command| {
+        matches!(
+            command,
+            ArcRenderCommand::DrawIndirect { .. }
+                | ArcRenderCommand::MultiDrawIndirectCount { .. }
+                | ArcRenderCommand::WriteTimestamp { .. }
+                | ArcRenderCommand::BeginOcclusionQuery { .. }
+                | ArcRenderCommand::EndOcclusionQuery
+                | ArcRenderCommand::BeginPipelineStatisticsQuery { .. }
+                | ArcRenderCommand::EndPipelineStatisticsQuery
+                | ArcRenderCommand::ExecuteBundle(_)
+        )
+    })
 }
 
 fn set_pipeline(
