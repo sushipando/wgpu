@@ -23,3 +23,20 @@ pub fn set_present_min_duration(seconds: Option<f64>) {
     #[cfg(not(metal))]
     let _ = seconds;
 }
+
+/// Measures how busy the GPU is (see `gpu_busy_fraction`). Only on Metal.
+pub fn set_gpu_timing(enabled: bool) {
+    #[cfg(metal)]
+    hal::metal::set_gpu_timing(enabled);
+    #[cfg(not(metal))]
+    let _ = enabled;
+}
+
+/// The fraction of the last measured second the GPU spent on Ruffle's command buffers,
+/// while measured (see `set_gpu_timing`). `None` on other backends.
+pub fn gpu_busy_fraction() -> Option<f64> {
+    #[cfg(metal)]
+    return hal::metal::gpu_busy_fraction();
+    #[cfg(not(metal))]
+    None
+}

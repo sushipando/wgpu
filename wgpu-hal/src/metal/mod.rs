@@ -479,6 +479,17 @@ static_assertions::assert_impl_all!(Queue: Send, Sync);
 /// refreshes), instead of whenever they happen to be ready.
 static PRESENT_MIN_DURATION: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 
+/// Measures how busy the GPU is (see `gpu_busy_fraction`).
+pub fn set_gpu_timing(enabled: bool) {
+    gpu_stats::set_timing(enabled);
+}
+
+/// The fraction of the last measured second the GPU spent on our command buffers, while
+/// measured (see `set_gpu_timing`).
+pub fn gpu_busy_fraction() -> Option<f64> {
+    gpu_stats::busy_fraction()
+}
+
 /// See `PRESENT_MIN_DURATION`.
 pub fn set_present_min_duration(seconds: Option<f64>) {
     PRESENT_MIN_DURATION.store(
@@ -1482,9 +1493,30 @@ mod gpu_stats {
         count: 0,
     });
 
+    /// Whether GPU time is measured: with `RUFFLE_PERF` (which also prints it once a
+    /// second), or when requested through `set_timing`.
     pub fn enabled() -> bool {
+        printing() || TIMING.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn printing() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_PERF").is_some())
+    }
+
+    static TIMING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// The fraction of the last measured second that the GPU spent on our command buffers
+    /// (as `f64` bits), or `u64::MAX` before the first.
+    static LAST_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+    pub fn set_timing(enabled: bool) {
+        TIMING.store(enabled, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn busy_fraction() -> Option<f64> {
+        let bits = LAST_BUSY.load(core::sync::atomic::Ordering::Relaxed);
+        (bits != u64::MAX).then(|| f64::from_bits(bits))
     }
 
     /// With `RUFFLE_GPU_LABELS` too: GPU time is also summed per command buffer label
@@ -1559,13 +1591,19 @@ mod gpu_stats {
         stats.count += 1;
         let window = end - stats.window_start;
         if window >= 1.0 {
-            std::eprintln!(
-                "[gpu-time] busy {:5.0}ms/s ({:3.0}%) | {:6.0} cmdbufs/s | {:6.1}us busy per cmdbuf",
-                stats.busy * 1000.0 / window,
-                stats.busy * 100.0 / window,
-                stats.count as f64 / window,
-                stats.busy * 1e6 / stats.count as f64,
+            LAST_BUSY.store(
+                (stats.busy / window).to_bits(),
+                core::sync::atomic::Ordering::Relaxed,
             );
+            if printing() {
+                std::eprintln!(
+                    "[gpu-time] busy {:5.0}ms/s ({:3.0}%) | {:6.0} cmdbufs/s | {:6.1}us busy per cmdbuf",
+                    stats.busy * 1000.0 / window,
+                    stats.busy * 100.0 / window,
+                    stats.count as f64 / window,
+                    stats.busy * 1e6 / stats.count as f64,
+                );
+            }
             stats.window_start = end;
             stats.busy = 0.0;
             stats.count = 0;
