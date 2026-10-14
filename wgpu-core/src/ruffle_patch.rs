@@ -14,3 +14,12 @@ pub fn set_share_command_buffers(enabled: bool) {
 pub(crate) fn share_command_buffers() -> bool {
     SHARE_COMMAND_BUFFERS.load(Ordering::Relaxed)
 }
+
+/// Presents frames on Metal so that each stays on screen for at least this long (see the
+/// vendored wgpu-hal's `metal::set_present_min_duration`). No effect on other backends.
+pub fn set_present_min_duration(seconds: Option<f64>) {
+    #[cfg(metal)]
+    hal::metal::set_present_min_duration(seconds);
+    #[cfg(not(metal))]
+    let _ = seconds;
+}

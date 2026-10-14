@@ -472,6 +472,21 @@ pub struct Queue {
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(Queue: Send, Sync);
 
+/// Ruffle patch: the minimum time (in seconds) that each presented frame stays on screen
+/// before the next one replaces it, or 0 to present as soon as possible. Presenting with
+/// `presentDrawable:afterMinimumDuration:` paces frames evenly on the display's refresh
+/// grid (for example, a 24 fps movie on a 144 Hz display shows each frame for exactly 6
+/// refreshes), instead of whenever they happen to be ready.
+static PRESENT_MIN_DURATION: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// See `PRESENT_MIN_DURATION`.
+pub fn set_present_min_duration(seconds: Option<f64>) {
+    PRESENT_MIN_DURATION.store(
+        seconds.filter(|s| *s > 0.0).unwrap_or(0.0).to_bits(),
+        atomic::Ordering::Relaxed,
+    );
+}
+
 impl Queue {
     pub unsafe fn queue_from_raw(
         raw: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -828,6 +843,8 @@ impl crate::Queue for Queue {
         _surface: &Surface,
         texture: SurfaceTexture,
     ) -> Result<(), crate::SurfaceError> {
+        // Ruffle patch: see `set_present_min_duration`.
+        let min_duration = f64::from_bits(PRESENT_MIN_DURATION.load(atomic::Ordering::Relaxed));
         autoreleasepool(|_| {
             // We do not bother adjusting `command_buffer_created_not_submitted`
             // because we immediately commit this buffer.
@@ -836,7 +853,12 @@ impl crate::Queue for Queue {
 
             // https://developer.apple.com/documentation/quartzcore/cametallayer/1478157-presentswithtransaction?language=objc
             if !texture.present_with_transaction {
-                command_buffer.presentDrawable(&texture.drawable);
+                if min_duration > 0.0 {
+                    command_buffer
+                        .presentDrawable_afterMinimumDuration(&texture.drawable, min_duration);
+                } else {
+                    command_buffer.presentDrawable(&texture.drawable);
+                }
             }
 
             command_buffer.commit();
