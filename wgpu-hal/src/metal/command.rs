@@ -153,6 +153,61 @@ impl Encoder<'_> {
 }
 
 impl super::CommandEncoder {
+    /// Creates the Metal command buffer for the current encoding, if not done yet.
+    fn ensure_raw_cmd_buf(&mut self) -> &Retained<ProtocolObject<dyn MTLCommandBuffer>> {
+        if self.raw_cmd_buf.is_none() {
+            let label = self
+                .pending_encoding
+                .clone()
+                .expect("encoding must have begun");
+            let queue = &self.queue_shared.raw;
+            let retain_references = self.shared.settings.retain_command_buffer_references;
+            let relay = self.queue_shared.relay.get();
+
+            // Guard against exhausting Metal's command buffer budget. Use the hard
+            // limit (`MAX_COMMAND_BUFFERS`) so we fail before Metal can hang inside
+            // `new_command_buffer`.
+            let previous = self
+                .queue_shared
+                .command_buffer_created_not_submitted
+                .fetch_add(1, atomic::Ordering::AcqRel);
+            if previous >= adapter::MAX_COMMAND_BUFFERS {
+                let current = previous + 1;
+                log::warn!(
+                    "metal: refusing to create new command buffer; {current} outstanding command \
+                     buffers exceeds the limit of {}. Treating this as device lost. \
+                     Ensure command encoders are submitted or dropped rather than kept alive \
+                     to avoid exhausting Metal's command buffer budget.",
+                    adapter::MAX_COMMAND_BUFFERS
+                );
+                panic!("metal: exceeded the command buffer limit");
+            }
+
+            let raw = autoreleasepool(move |_| {
+                let cmd_buf_ref = if retain_references {
+                    queue.commandBuffer()
+                } else {
+                    queue.commandBufferWithUnretainedReferences()
+                }
+                .unwrap();
+                if let Some(label) = label.as_deref() {
+                    cmd_buf_ref.setLabel(Some(&NSString::from_str(label)));
+                }
+                // If strict event sync is enabled on this queue, gate the
+                // CB on the relay event at the value the next submit will
+                // signal. The CB pauses at the start until the relay fires.
+                if let Some(relay) = relay {
+                    let expected = relay.next_release_value.load(atomic::Ordering::Acquire);
+                    cmd_buf_ref.encodeWaitForEvent_value(relay.event.as_ref(), expected);
+                }
+                cmd_buf_ref.to_owned()
+            });
+
+            self.raw_cmd_buf = Some(raw);
+        }
+        self.raw_cmd_buf.as_ref().unwrap()
+    }
+
     pub fn raw_command_buffer(&self) -> Option<&ProtocolObject<dyn MTLCommandBuffer>> {
         self.raw_cmd_buf.as_deref()
     }
@@ -161,7 +216,7 @@ impl super::CommandEncoder {
         if self.state.blit.is_none() {
             self.leave_acceleration_structure_builder();
             debug_assert!(self.state.render.is_none() && self.state.compute.is_none());
-            let cmd_buf = self.raw_cmd_buf.as_ref().unwrap();
+            let cmd_buf = self.ensure_raw_cmd_buf().clone();
 
             // This code path is currently unused since the written timestamp is always 0.
             // We should see if we can get it working again, if not remove the code.
@@ -271,7 +326,7 @@ impl super::CommandEncoder {
                     && self.state.compute.is_none()
                     && self.state.blit.is_none()
             );
-            let cmd_buf = self.raw_cmd_buf.as_ref().unwrap();
+            let cmd_buf = self.ensure_raw_cmd_buf().clone();
             autoreleasepool(|_| {
                 self.state.acceleration_structure_builder =
                     cmd_buf.accelerationStructureCommandEncoder().to_owned();
@@ -477,55 +532,18 @@ impl crate::CommandEncoder for super::CommandEncoder {
     type A = super::Api;
 
     unsafe fn begin_encoding(&mut self, label: crate::Label) -> Result<(), crate::DeviceError> {
-        let queue = &self.queue_shared.raw;
-        let retain_references = self.shared.settings.retain_command_buffer_references;
-        let relay = self.queue_shared.relay.get();
-
-        // Guard against exhausting Metal's command buffer budget. Use the hard
-        // limit (`MAX_COMMAND_BUFFERS`) so we fail before Metal can hang inside
-        // `new_command_buffer`.
-        let previous = self
-            .queue_shared
-            .command_buffer_created_not_submitted
-            .fetch_add(1, atomic::Ordering::AcqRel);
-        if previous >= adapter::MAX_COMMAND_BUFFERS {
-            let current = previous + 1;
-            log::warn!(
-                "metal: refusing to create new command buffer; {current} outstanding command \
-                 buffers exceeds the limit of {}. Treating this as device lost. \
-                 Ensure command encoders are submitted or dropped rather than kept alive \
-                 to avoid exhausting Metal's command buffer budget.",
-                adapter::MAX_COMMAND_BUFFERS
-            );
-            return Err(crate::DeviceError::Lost);
-        }
-
-        let raw = autoreleasepool(move |_| {
-            let cmd_buf_ref = if retain_references {
-                queue.commandBuffer()
-            } else {
-                queue.commandBufferWithUnretainedReferences()
-            }
-            .unwrap();
-            if let Some(label) = label {
-                cmd_buf_ref.setLabel(Some(&NSString::from_str(label)));
-            }
-            // If strict event sync is enabled on this queue, gate the
-            // CB on the relay event at the value the next submit will
-            // signal. The CB pauses at the start until the relay fires.
-            if let Some(relay) = relay {
-                let expected = relay.next_release_value.load(atomic::Ordering::Acquire);
-                cmd_buf_ref.encodeWaitForEvent_value(relay.event.as_ref(), expected);
-            }
-            cmd_buf_ref.to_owned()
-        });
+        // The Metal command buffer is created lazily by `ensure_raw_cmd_buf`,
+        // so that encoders which never record anything (e.g. the per-pass
+        // barrier encoders wgpu-core creates, as barriers are no-ops on Metal)
+        // cost nothing.
+        debug_assert!(self.raw_cmd_buf.is_none());
 
         // Queries should either be closed out, or cleared in `discard_encoding`.
         // This assertion is here mainly to facilitate comparison with the other
         // backends, which clear in `begin_encoding` rather than `discard_encoding`.
         debug_assert!(self.state.pending_timer_queries.is_empty());
 
-        self.raw_cmd_buf = Some(raw);
+        self.pending_encoding = Some(label.map(alloc::string::String::from));
 
         Ok(())
     }
@@ -542,6 +560,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
             encoder.endEncoding();
         }
         self.state.pending_timer_queries.clear();
+        self.pending_encoding = None;
         let had_command_buffer = self.raw_cmd_buf.is_some();
         // Clear the Option first so the underlying `metal::CommandBuffer` is
         // dropped before we update the counter.
@@ -566,8 +585,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
         debug_assert!(self.state.compute.is_none());
         debug_assert!(self.state.pending_timer_queries.is_empty());
 
+        self.pending_encoding = None;
         Ok(super::CommandBuffer {
-            raw: self.raw_cmd_buf.take().unwrap(),
+            raw: self.raw_cmd_buf.take(),
             queue_shared: Arc::clone(&self.queue_shared),
         })
     }
@@ -1049,7 +1069,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
             if let Some(mv) = desc.multiview_mask {
                 descriptor.setRenderTargetArrayLength(32 - mv.leading_zeros() as usize);
             }
-            let raw = self.raw_cmd_buf.as_ref().unwrap();
+            let raw = self.ensure_raw_cmd_buf().clone();
             let encoder = raw.renderCommandEncoderWithDescriptor(&descriptor).unwrap();
             if let Some(mv) = desc.multiview_mask {
                 // Most likely the API just wasn't thought about enough. It's not like they ever allow you
@@ -1260,15 +1280,16 @@ impl crate::CommandEncoder for super::CommandEncoder {
     unsafe fn begin_debug_marker(&mut self, group_label: &str) {
         if let Some(encoder) = self.active_encoder() {
             encoder.pushDebugGroup(&NSString::from_str(group_label));
-        } else if let Some(ref buf) = self.raw_cmd_buf {
-            buf.pushDebugGroup(&NSString::from_str(group_label));
+        } else {
+            self.ensure_raw_cmd_buf()
+                .pushDebugGroup(&NSString::from_str(group_label));
         }
     }
     unsafe fn end_debug_marker(&mut self) {
         if let Some(encoder) = self.active_encoder() {
             encoder.popDebugGroup();
-        } else if let Some(ref buf) = self.raw_cmd_buf {
-            buf.popDebugGroup();
+        } else {
+            self.ensure_raw_cmd_buf().popDebugGroup();
         }
     }
 
@@ -1689,7 +1710,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         debug_assert!(self.state.compute.is_none());
         debug_assert!(self.state.render.is_none());
 
-        let raw = self.raw_cmd_buf.as_ref().unwrap();
+        let raw = self.ensure_raw_cmd_buf().clone();
 
         autoreleasepool(|_| {
             // TimeStamp Queries and ComputePassDescriptor were both introduced in Metal 2.3 (macOS 11, iOS 14)
@@ -1897,18 +1918,17 @@ impl crate::CommandEncoder for super::CommandEncoder {
         command_buffers: &[&super::CommandBuffer],
         dependencies: &[&super::AccelerationStructure],
     ) {
-        let Some(first_command_buffer) = command_buffers.first() else {
+        let Some(first_raw) = command_buffers.iter().find_map(|c| c.raw.as_ref()) else {
             return;
         };
         let desc = MTLResidencySetDescriptor::new();
-        desc.setLabel(first_command_buffer.raw.label().as_deref());
-        let residency_set = first_command_buffer
-            .raw
+        desc.setLabel(first_raw.label().as_deref());
+        let residency_set = first_raw
             .device()
             .newResidencySetWithDescriptor_error(&desc)
             .unwrap();
-        for command_buffer in command_buffers {
-            command_buffer.raw.useResidencySet(&residency_set);
+        for raw in command_buffers.iter().filter_map(|c| c.raw.as_ref()) {
+            raw.useResidencySet(&residency_set);
         }
         for dependency in dependencies {
             residency_set.addAllocation(ProtocolObject::from_ref(&*dependency.raw));
@@ -1965,7 +1985,10 @@ impl Drop for super::CommandBuffer {
         // `command_buffer_created_not_submitted` is usually decremented when the command
         // buffer is submitted. But if we're dropping a command buffer that was never
         // submitted, we need to decrement the count here.
-        let status = self.raw.status();
+        let Some(raw) = &self.raw else {
+            return;
+        };
+        let status = raw.status();
         if status == MTLCommandBufferStatus::NotEnqueued
             || status == MTLCommandBufferStatus::Enqueued
         {

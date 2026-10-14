@@ -741,8 +741,12 @@ impl crate::Queue for Queue {
                     fence_sync.1.notify_all();
                 });
 
-                let raw = match command_buffers.last() {
-                    Some(&cmd_buf) => cmd_buf.raw.clone(),
+                let last_raw = command_buffers
+                    .iter()
+                    .rev()
+                    .find_map(|cmd_buf| cmd_buf.raw.as_ref());
+                let raw = match last_raw {
+                    Some(raw) => raw.clone(),
                     None => {
                         // We do not bother adjusting `command_buffer_created_not_submitted`
                         // because we immediately commit this buffer.
@@ -775,14 +779,26 @@ impl crate::Queue for Queue {
                 }
 
                 // only return an extra one if it's extra
-                match command_buffers.last() {
+                match last_raw {
                     Some(_) => None,
                     None => Some(raw),
                 }
             };
 
             for cmd_buffer in command_buffers {
-                cmd_buffer.raw.commit();
+                let Some(raw) = &cmd_buffer.raw else {
+                    continue;
+                };
+                if gpu_stats::enabled() {
+                    let block = block2::RcBlock::new(
+                        |cmd_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                            let cmd_buf = unsafe { cmd_buf.as_ref() };
+                            gpu_stats::record(cmd_buf.GPUStartTime(), cmd_buf.GPUEndTime());
+                        },
+                    );
+                    unsafe { raw.addCompletedHandler(block2::RcBlock::as_ptr(&block)) };
+                }
+                raw.commit();
                 // One command buffer per `end_encoding` call moves from the
                 // "created but not yet submitted" bucket into the submitted
                 // set, so update the counter.
@@ -1354,6 +1370,9 @@ pub struct CommandEncoder {
     shared: Arc<AdapterShared>,
     queue_shared: Arc<QueueShared>,
     raw_cmd_buf: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Set between `begin_encoding` and `end_encoding`/`discard_encoding`.
+    /// The Metal command buffer itself is only created once something is encoded.
+    pending_encoding: Option<Option<String>>,
     state: CommandState,
     temp: Temp,
     counters: Arc<wgt::HalCounters>,
@@ -1363,6 +1382,7 @@ impl fmt::Debug for CommandEncoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CommandEncoder")
             .field("raw_cmd_buf", &self.raw_cmd_buf)
+            .field("pending_encoding", &self.pending_encoding)
             .finish()
     }
 }
@@ -1372,7 +1392,10 @@ unsafe impl Sync for CommandEncoder {}
 
 #[derive(Debug)]
 pub struct CommandBuffer {
-    raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    /// `None` if nothing was encoded; such command buffers are skipped on submit.
+    /// (Ruffle patch: avoids creating and committing empty Metal command buffers,
+    /// which wgpu-core requests for every pass's barriers.)
+    raw: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     queue_shared: Arc<QueueShared>,
 }
 
@@ -1407,4 +1430,60 @@ pub enum OsType {
     Ios,
     Tvos,
     VisionOs,
+}
+
+/// Ruffle patch: optional GPU execution time statistics, enabled by `RUFFLE_PERF`.
+/// Once a second, prints how long the GPU was busy executing command buffers.
+mod gpu_stats {
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
+
+    struct Stats {
+        window_start: f64,
+        busy: f64,
+        max_end: f64,
+        count: u64,
+    }
+
+    static STATS: Mutex<Stats> = Mutex::new(Stats {
+        window_start: 0.0,
+        busy: 0.0,
+        max_end: 0.0,
+        count: 0,
+    });
+
+    pub fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_PERF").is_some())
+    }
+
+    pub fn record(start: f64, end: f64) {
+        if end <= 0.0 || end < start {
+            return;
+        }
+        let mut stats = STATS.lock();
+        if stats.window_start == 0.0 {
+            stats.window_start = start;
+        }
+        // Count overlapping command buffers only once.
+        let effective_start = start.max(stats.max_end);
+        if end > effective_start {
+            stats.busy += end - effective_start;
+        }
+        stats.max_end = stats.max_end.max(end);
+        stats.count += 1;
+        let window = end - stats.window_start;
+        if window >= 1.0 {
+            std::eprintln!(
+                "[gpu-time] busy {:5.0}ms/s ({:3.0}%) | {:6.0} cmdbufs/s | {:6.1}us busy per cmdbuf",
+                stats.busy * 1000.0 / window,
+                stats.busy * 100.0 / window,
+                stats.count as f64 / window,
+                stats.busy * 1e6 / stats.count as f64,
+            );
+            stats.window_start = end;
+            stats.busy = 0.0;
+            stats.count = 0;
+        }
+    }
 }
