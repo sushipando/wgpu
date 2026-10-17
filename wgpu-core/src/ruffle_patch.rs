@@ -24,6 +24,16 @@ pub fn set_present_min_duration(seconds: Option<f64>) {
     let _ = seconds;
 }
 
+/// Shows the next frame presented on this thread at the given time, on Metal (see the
+/// vendored wgpu-hal's `metal::set_present_time`). No effect on other backends.
+#[cfg(feature = "std")]
+pub fn set_present_time(time: Option<std::time::Instant>) {
+    #[cfg(metal)]
+    hal::metal::set_present_time(time);
+    #[cfg(not(metal))]
+    let _ = time;
+}
+
 /// Measures how busy the GPU is (see `gpu_busy_fraction`). Only on Metal.
 pub fn set_gpu_timing(enabled: bool) {
     #[cfg(metal)]

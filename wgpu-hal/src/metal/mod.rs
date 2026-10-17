@@ -498,6 +498,23 @@ pub fn set_present_min_duration(seconds: Option<f64>) {
     );
 }
 
+std::thread_local! {
+    /// Ruffle patch: see `set_present_time`.
+    static PRESENT_TIME: core::cell::Cell<Option<std::time::Instant>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Ruffle patch: shows the next frame presented on this thread at the given time (with
+/// `presentDrawable:atTime:`) instead of as soon as possible (or paced by
+/// `set_present_min_duration`). Frames are then shown at times taken from the
+/// application's own clock, so one that's shown late doesn't delay the ones after it. With
+/// a minimum duration, each frame waits for the one before it to have been shown long
+/// enough, so after one late frame, frames presented as often as they're shown all stay
+/// late (and fill the queue of drawables).
+pub fn set_present_time(time: Option<std::time::Instant>) {
+    PRESENT_TIME.with(|t| t.set(time));
+}
+
 impl Queue {
     pub unsafe fn queue_from_raw(
         raw: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -854,8 +871,17 @@ impl crate::Queue for Queue {
         _surface: &Surface,
         texture: SurfaceTexture,
     ) -> Result<(), crate::SurfaceError> {
-        // Ruffle patch: see `set_present_min_duration`.
+        // Ruffle patch: see `set_present_min_duration` and `set_present_time`.
         let min_duration = f64::from_bits(PRESENT_MIN_DURATION.load(atomic::Ordering::Relaxed));
+        let present_time = PRESENT_TIME.with(|t| t.take()).map(|time| {
+            // Host time (`mach_absolute_time`), in seconds, like `CACurrentMediaTime`.
+            let now = std::time::Instant::now();
+            let host_now = time::host_time_seconds();
+            match time.checked_duration_since(now) {
+                Some(ahead) => host_now + ahead.as_secs_f64(),
+                None => host_now - now.duration_since(time).as_secs_f64(),
+            }
+        });
         autoreleasepool(|_| {
             // We do not bother adjusting `command_buffer_created_not_submitted`
             // because we immediately commit this buffer.
@@ -864,7 +890,9 @@ impl crate::Queue for Queue {
 
             // https://developer.apple.com/documentation/quartzcore/cametallayer/1478157-presentswithtransaction?language=objc
             if !texture.present_with_transaction {
-                if min_duration > 0.0 {
+                if let Some(present_time) = present_time {
+                    command_buffer.presentDrawable_atTime(&texture.drawable, present_time);
+                } else if min_duration > 0.0 {
                     command_buffer
                         .presentDrawable_afterMinimumDuration(&texture.drawable, min_duration);
                 } else {

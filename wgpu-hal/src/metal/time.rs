@@ -36,3 +36,19 @@ impl PresentationTimer {
         (time as u128 * self.scale.numerator as u128) / self.scale.denominator as u128
     }
 }
+
+/// Ruffle patch: the current host time (`mach_absolute_time`) in seconds, as used by
+/// `CACurrentMediaTime` and `presentDrawable:atTime:`.
+pub fn host_time_seconds() -> f64 {
+    static SCALE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let (numerator, denominator) = *SCALE.get_or_init(|| {
+        let mut scale = MachTimebaseInfo {
+            numerator: 1,
+            denominator: 1,
+        };
+        unsafe { mach_timebase_info(&mut scale) };
+        (scale.numerator, scale.denominator)
+    });
+    let time = unsafe { mach_absolute_time() };
+    (time as f64 * numerator as f64 / denominator as f64) / 1e9
+}
