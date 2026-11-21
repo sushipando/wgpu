@@ -2309,7 +2309,7 @@ pub(super) fn encode_render_pass(
         &color_attachments,
         depth_stencil_attachment.as_ref(),
         timestamp_writes.is_some() || occlusion_query_set.is_some(),
-        parent_state.texture_memory_actions.has_discards(),
+        parent_state.texture_memory_actions,
     );
 
     let raw_encoder = if share_command_buffer {
@@ -2805,7 +2805,8 @@ pub(super) fn encode_render_pass(
 /// the current command buffer, with its (no-op) barriers recorded after it.
 ///
 /// Conservatively, the pass must not need:
-/// - clears of discarded surfaces (none are discarded so far, and it discards none),
+/// - clears of discarded surfaces (none of its loaded attachments or bound textures are
+///   currently in `texture_memory_actions.discards`),
 /// - query resets (no queries),
 /// - indirect draw validation (no indirect draws or bundles, which may contain them).
 fn can_share_command_buffer(
@@ -2814,37 +2815,51 @@ fn can_share_command_buffer(
     color_attachments: &ColorAttachments<Arc<TextureView>>,
     depth_stencil_attachment: Option<&ResolvedRenderPassDepthStencilAttachment<Arc<TextureView>>>,
     has_pass_queries: bool,
-    has_discards: bool,
+    texture_memory_actions: &CommandBufferTextureMemoryActions,
 ) -> bool {
     if device.backend() != wgt::Backend::Metal
         || !crate::ruffle_patch::share_command_buffers()
         || has_pass_queries
-        || has_discards
     {
         return false;
     }
-    let discards_color = color_attachments
-        .iter()
-        .flatten()
-        .any(|at| at.store_op == StoreOp::Discard);
-    let discards_depth_stencil = depth_stencil_attachment.is_some_and(|at| {
-        at.depth.store_op() == StoreOp::Discard || at.stencil.store_op() == StoreOp::Discard
-    });
-    if discards_color || discards_depth_stencil {
-        return false;
+    let has_discards = texture_memory_actions.has_discards();
+    if has_discards {
+        let loads_discarded_color = color_attachments.iter().flatten().any(|at| {
+            matches!(at.load_op, LoadOp::Load)
+                && texture_memory_actions.would_require_discard_fixup(
+                    &at.view.parent,
+                    &TextureInitRange::from(at.view.selector.clone()),
+                )
+        });
+        let loads_discarded_ds = depth_stencil_attachment.is_some_and(|at| {
+            (at.depth.load_op() == LoadOp::Load || at.stencil.load_op() == LoadOp::Load)
+                && texture_memory_actions.would_require_discard_fixup(
+                    &at.view.parent,
+                    &TextureInitRange::from(at.view.selector.clone()),
+                )
+        });
+        if loads_discarded_color || loads_discarded_ds {
+            return false;
+        }
     }
-    !commands.iter().any(|command| {
-        matches!(
-            command,
-            ArcRenderCommand::DrawIndirect { .. }
-                | ArcRenderCommand::MultiDrawIndirectCount { .. }
-                | ArcRenderCommand::WriteTimestamp { .. }
-                | ArcRenderCommand::BeginOcclusionQuery { .. }
-                | ArcRenderCommand::EndOcclusionQuery
-                | ArcRenderCommand::BeginPipelineStatisticsQuery { .. }
-                | ArcRenderCommand::EndPipelineStatisticsQuery
-                | ArcRenderCommand::ExecuteBundle(_)
-        )
+    !commands.iter().any(|command| match command {
+        ArcRenderCommand::DrawIndirect { .. }
+        | ArcRenderCommand::MultiDrawIndirectCount { .. }
+        | ArcRenderCommand::WriteTimestamp { .. }
+        | ArcRenderCommand::BeginOcclusionQuery { .. }
+        | ArcRenderCommand::EndOcclusionQuery
+        | ArcRenderCommand::BeginPipelineStatisticsQuery { .. }
+        | ArcRenderCommand::EndPipelineStatisticsQuery
+        | ArcRenderCommand::ExecuteBundle(_) => true,
+        ArcRenderCommand::SetBindGroup {
+            bind_group: Some(bg),
+            ..
+        } if has_discards => bg.texture_init_actions.iter().any(|action| {
+            matches!(action.kind, MemoryInitKind::NeedsInitializedMemory)
+                && texture_memory_actions.would_require_discard_fixup(&action.texture, &action.range)
+        }),
+        _ => false,
     })
 }
 

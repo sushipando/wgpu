@@ -46,12 +46,34 @@ impl CommandBufferTextureMemoryActions {
         !self.discards.is_empty()
     }
 
+    /// Ruffle patch: whether reading `texture` over `range` would need an immediate
+    /// clear of a currently discarded surface.
+    pub(crate) fn would_require_discard_fixup(
+        &self,
+        texture: &Arc<Texture>,
+        range: &TextureInitRange,
+    ) -> bool {
+        self.discards.iter().any(|discarded| {
+            discarded.texture.is_equal(texture)
+                && range.layer_range.contains(&discarded.layer)
+                && range.mip_range.contains(&discarded.mip_level)
+        })
+    }
+
     pub(crate) fn drain_init_actions(&mut self) -> Drain<'_, TextureInitTrackerAction> {
         self.init_actions.drain(..)
     }
 
     pub(crate) fn discard(&mut self, discard: TextureSurfaceDiscard) {
-        self.discards.push(discard);
+        // Ruffle patch: avoid accumulating duplicate entries when a pooled texture is
+        // cleared and discarded across multiple passes in the same encoder.
+        if !self.discards.iter().any(|existing| {
+            existing.texture.is_equal(&discard.texture)
+                && existing.mip_level == discard.mip_level
+                && existing.layer == discard.layer
+        }) {
+            self.discards.push(discard);
+        }
     }
 
     // Registers a TextureInitTrackerAction.
